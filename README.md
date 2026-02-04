@@ -119,7 +119,7 @@ FLAGS:
 OPTIONS:
     -E, --err-ttl <err_ttl>                          TTL for errors, in seconds [default: 2]
     -H, --hostname <hostname>                        Host name (not IP address) DoH clients will use to connect
-    -l, --listen-address <listen_address>            Address to listen to [default: 127.0.0.1:3000]
+    -l, --listen-address <listen_address>            Address to listen to (can be specified multiple times) [default: 127.0.0.1:3000]
     -b, --local-bind-address <local_bind_address>    Address to connect from
     -c, --max-clients <max_clients>                  Maximum number of simultaneous clients [default: 512]
     -C, --max-concurrent <max_concurrent>            Maximum number of concurrent requests per client [default: 16]
@@ -140,6 +140,12 @@ OPTIONS:
     --ecs-prefix-v4 <ecs_prefix_v4>         IPv4 prefix length for EDNS Client Subnet [default: 24]
     --ecs-prefix-v6 <ecs_prefix_v6>         IPv6 prefix length for EDNS Client Subnet [default: 56]
 ```
+
+**Listening behavior:**
+- You can specify `-l/--listen-address` multiple times (for example, IPv4 and IPv6).
+- The server attempts to bind all configured addresses.
+- If at least one bind succeeds, the server starts and logs failures for the rest.
+- If all binds fail, the server exits with an error.
 
 ### Example Configurations
 
@@ -220,6 +226,7 @@ doh-proxy -H 'doh.example.com' \
 - Certificates and keys must be in PEM/PKCS#8 format
 - Can be stored in the same file or separately
 - Automatically reloaded when changed (no restart needed)
+- New connections always use the latest loaded certificates across all listeners
 
 If using ECDSA certificates that start with `-----BEGIN EC PRIVATE KEY-----`, convert to PKCS#8:
 

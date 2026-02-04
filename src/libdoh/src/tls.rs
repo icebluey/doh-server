@@ -4,27 +4,25 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{future::FutureExt, join, select};
-use hyper::server::conn::Http;
-use tokio::{
-    net::TcpListener,
-    sync::mpsc::{self, Receiver},
-};
+use arc_swap::ArcSwap;
+use futures::{future::join_all, join};
+use tokio::net::TcpListener;
 use tokio_rustls::{
-    rustls::{Certificate, PrivateKey, ServerConfig},
+    rustls::pki_types::{CertificateDer, PrivateKeyDer},
+    rustls::ServerConfig as RustlsServerConfig,
     TlsAcceptor,
 };
 
 use crate::constants::CERTS_WATCH_DELAY_SECS;
 use crate::errors::*;
-use crate::{DoH, LocalExecutor};
+use crate::{DoH, ServerConfig as HttpServerConfig};
 
 pub fn create_tls_acceptor<P, P2>(certs_path: P, certs_keys_path: P2) -> io::Result<TlsAcceptor>
 where
     P: AsRef<Path>,
     P2: AsRef<Path>,
 {
-    let certs: Vec<_> = {
+    let certs: Vec<CertificateDer<'static>> = {
         let certs_path_str = certs_path.as_ref().display().to_string();
         let mut reader = BufReader::new(File::open(certs_path).map_err(|e| {
             io::Error::new(
@@ -32,17 +30,16 @@ where
                 format!("Unable to load the certificates [{certs_path_str}]: {e}"),
             )
         })?);
-        rustls_pemfile::certs(&mut reader).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unable to parse the certificates",
-            )
-        })?
-    }
-    .drain(..)
-    .map(Certificate)
-    .collect();
-    let certs_keys: Vec<_> = {
+        rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Unable to parse the certificates: {e}"),
+                )
+            })?
+    };
+    let certs_keys: Vec<PrivateKeyDer<'static>> = {
         let certs_keys_path_str = certs_keys_path.as_ref().display().to_string();
         let encoded_keys = {
             let mut encoded_keys = vec![];
@@ -57,37 +54,42 @@ where
             encoded_keys
         };
         let mut reader = Cursor::new(encoded_keys);
-        let pkcs8_keys = rustls_pemfile::pkcs8_private_keys(&mut reader).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unable to parse the certificates private keys (PKCS8)",
-            )
-        })?;
+        let pkcs8_keys = rustls_pemfile::pkcs8_private_keys(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Unable to parse the certificates private keys (PKCS8): {e}"),
+                )
+            })?;
         reader.set_position(0);
-        let mut rsa_keys = rustls_pemfile::rsa_private_keys(&mut reader).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unable to parse the certificates private keys (RSA)",
-            )
-        })?;
-        let mut keys = pkcs8_keys;
-        keys.append(&mut rsa_keys);
+        let rsa_keys = rustls_pemfile::rsa_private_keys(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Unable to parse the certificates private keys (RSA): {e}"),
+                )
+            })?;
+        let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_keys
+            .into_iter()
+            .map(PrivateKeyDer::from)
+            .collect();
+        keys.extend(rsa_keys.into_iter().map(PrivateKeyDer::from));
         if keys.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "No private keys found - Make sure that they are in PKCS#8/PEM format",
             ));
         }
-        keys.drain(..).map(PrivateKey).collect()
+        keys
     };
 
     let mut server_config = certs_keys
         .into_iter()
         .find_map(|certs_key| {
-            let server_config_builder = ServerConfig::builder()
-                .with_safe_defaults()
-                .with_no_client_auth();
-            server_config_builder
+            RustlsServerConfig::builder()
+                .with_no_client_auth()
                 .with_single_cert(certs.clone(), certs_key)
                 .ok()
         })
@@ -104,44 +106,25 @@ where
 impl DoH {
     async fn start_https_service(
         self,
-        mut tls_acceptor_receiver: Receiver<TlsAcceptor>,
+        tls_acceptor_store: Arc<ArcSwap<Arc<TlsAcceptor>>>,
         listener: TcpListener,
-        server: Http<LocalExecutor>,
+        server_config: Arc<HttpServerConfig>,
     ) -> Result<(), DoHError> {
-        let mut tls_acceptor: Option<TlsAcceptor> = None;
-        let listener_service = async {
-            loop {
-                select! {
-                    tcp_cnx = listener.accept().fuse() => {
-                        if tls_acceptor.is_none() || tcp_cnx.is_err() {
-                            continue;
-                        }
-                        let (raw_stream, client_addr) = tcp_cnx.unwrap();
-                        if let Ok(stream) = tls_acceptor.as_ref().unwrap().accept(raw_stream).await {
-                            let mut doh = self.clone();
-                            doh.remote_addr = Some(client_addr);
-                            doh.client_serve(stream, server.clone()).await
-                        }
-                    }
-                    new_tls_acceptor = tls_acceptor_receiver.recv().fuse() => {
-                        if new_tls_acceptor.is_none() {
-                            break;
-                        }
-                        tls_acceptor = new_tls_acceptor;
-                    }
-                    complete => break
-                }
+        while let Ok((raw_stream, client_addr)) = listener.accept().await {
+            let current_acceptor = tls_acceptor_store.load();
+            if let Ok(stream) = current_acceptor.as_ref().as_ref().accept(raw_stream).await {
+                let mut doh = self.clone();
+                doh.remote_addr = Some(client_addr);
+                doh.client_serve(stream, Arc::clone(&server_config)).await
             }
-            Ok(()) as Result<(), DoHError>
-        };
-        listener_service.await?;
+        }
         Ok(())
     }
 
-    pub async fn start_with_tls(
+    pub(crate) async fn start_with_tls(
         self,
-        listener: TcpListener,
-        server: Http<LocalExecutor>,
+        listeners: Vec<TcpListener>,
+        server_config: Arc<HttpServerConfig>,
     ) -> Result<(), DoHError> {
         let certs_path = self
             .globals
@@ -165,22 +148,44 @@ impl DoH {
                 ))
             })?
             .clone();
-        let (tls_acceptor_sender, tls_acceptor_receiver) = mpsc::channel(1);
-        let https_service = self.start_https_service(tls_acceptor_receiver, listener, server);
+        let initial_acceptor = loop {
+            match create_tls_acceptor(&certs_path, &certs_keys_path) {
+                Ok(acceptor) => break acceptor,
+                Err(e) => {
+                    eprintln!("TLS certificates error: {e}");
+                    tokio::time::sleep(Duration::from_secs(CERTS_WATCH_DELAY_SECS.into())).await;
+                }
+            }
+        };
+        let tls_acceptor_store = Arc::new(ArcSwap::from_pointee(Arc::new(initial_acceptor)));
+
+        let mut https_services = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let doh = self.clone();
+            let server_config = Arc::clone(&server_config);
+            let tls_acceptor_store = Arc::clone(&tls_acceptor_store);
+            https_services.push(tokio::spawn(async move {
+                let _ = doh
+                    .start_https_service(tls_acceptor_store, listener, server_config)
+                    .await;
+            }));
+        }
         let cert_service = async {
             loop {
                 match create_tls_acceptor(&certs_path, &certs_keys_path) {
-                    Ok(tls_acceptor) => {
-                        if tls_acceptor_sender.send(tls_acceptor).await.is_err() {
-                            break;
-                        }
+                    Ok(new_acceptor) => {
+                        tls_acceptor_store.store(Arc::new(Arc::new(new_acceptor)));
                     }
                     Err(e) => eprintln!("TLS certificates error: {e}"),
                 }
                 tokio::time::sleep(Duration::from_secs(CERTS_WATCH_DELAY_SECS.into())).await;
             }
+        };
+        let https_service = async {
+            let _ = join_all(https_services).await;
             Ok::<_, DoHError>(())
         };
-        join!(https_service, cert_service).0
+        let (https_result, _) = join!(https_service, cert_service);
+        https_result
     }
 }

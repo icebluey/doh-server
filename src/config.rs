@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSoc
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Arg, ArgAction::SetTrue};
+use clap::{Arg, ArgAction::Append, ArgAction::SetTrue};
 use libdoh::*;
 
 use crate::constants::*;
@@ -52,7 +52,7 @@ pub fn parse_opts(globals: &mut Globals) {
                 .short('l')
                 .long("listen-address")
                 .num_args(1)
-                .default_value(LISTEN_ADDRESS)
+                .action(Append)
                 .value_parser(verify_sock_addr)
                 .help("Address to listen to"),
         )
@@ -192,12 +192,22 @@ pub fn parse_opts(globals: &mut Globals) {
 
     let matches = options.get_matches();
 
-    // Parse listen address
-    globals.listen_address = matches
-        .get_one::<String>("listen_address")
-        .expect("listen_address has a default value")
-        .parse()
-        .unwrap_or_else(|e| exit_with_error(&format!("Invalid listen address: {}", e)));
+    // Parse listen addresses
+    globals.listen_addresses = match matches.get_many::<String>("listen_address") {
+        Some(values) => values
+            .map(|value| {
+                value.parse().unwrap_or_else(|e| {
+                    exit_with_error(&format!("Invalid listen address '{}': {}", value, e))
+                })
+            })
+            .collect(),
+        None => vec![LISTEN_ADDRESS.parse().unwrap_or_else(|e| {
+            exit_with_error(&format!(
+                "Invalid default listen address '{}': {}",
+                LISTEN_ADDRESS, e
+            ))
+        })],
+    };
 
     // Parse server address
     let server_address_str = matches

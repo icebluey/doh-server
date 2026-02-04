@@ -39,7 +39,7 @@ fn main() {
         }
     };
 
-    let listen_address = match LISTEN_ADDRESS.parse() {
+    let default_listen_address = match LISTEN_ADDRESS.parse() {
         Ok(addr) => addr,
         Err(e) => {
             eprintln!(
@@ -67,7 +67,7 @@ fn main() {
         #[cfg(feature = "tls")]
         tls_cert_key_path: None,
 
-        listen_address,
+        listen_addresses: vec![default_listen_address],
         local_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         server_address,
         path: PATH.to_string(),

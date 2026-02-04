@@ -8,6 +8,8 @@ pub mod odoh;
 #[cfg(feature = "tls")]
 mod tls;
 
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,14 +17,18 @@ use std::time::Duration;
 
 use base64::engine::Engine;
 use byteorder::{BigEndian, ByteOrder};
-use futures::prelude::*;
-use futures::task::{Context, Poll};
+use bytes::Bytes;
+use futures::future::join_all;
+use http_body_util::{BodyExt, Full};
 use hyper::http;
-use hyper::server::conn::Http;
-use hyper::{Body, HeaderMap, Method, Request, Response, StatusCode};
+use hyper::body::Body;
+use hyper::body::Incoming;
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, UdpSocket};
-use tokio::runtime;
 
 use crate::constants::*;
 pub use crate::errors::*;
@@ -69,58 +75,50 @@ pub struct DoH {
     pub remote_addr: Option<SocketAddr>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ServerConfig {
+    keepalive: bool,
+    max_concurrent_streams: u32,
+}
+
+impl ServerConfig {
+    fn build(&self) -> auto::Builder<TokioExecutor> {
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        builder.http1().keep_alive(self.keepalive);
+        builder
+            .http2()
+            .max_concurrent_streams(self.max_concurrent_streams);
+        builder
+    }
+}
+
 #[allow(clippy::unnecessary_wraps)]
-fn http_error(status_code: StatusCode) -> Result<Response<Body>, http::Error> {
+fn http_error(status_code: StatusCode) -> Result<Response<Full<Bytes>>, http::Error> {
     let response = Response::builder()
         .status(status_code)
-        .body(Body::empty())
+        .body(Full::new(Bytes::new()))
         .unwrap();
     Ok(response)
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn http_error_with_cache(status_code: StatusCode) -> Result<Response<Body>, http::Error> {
+fn http_error_with_cache(status_code: StatusCode) -> Result<Response<Full<Bytes>>, http::Error> {
     // Return error with very long cache time (1 year) to prevent crawler bots from retrying
     let response = Response::builder()
         .status(status_code)
         .header(hyper::header::CACHE_CONTROL, "max-age=31536000, immutable")
-        .body(Body::empty())
+        .body(Full::new(Bytes::new()))
         .unwrap();
     Ok(response)
 }
 
-#[derive(Clone, Debug)]
-pub struct LocalExecutor {
-    runtime_handle: runtime::Handle,
-}
-
-impl LocalExecutor {
-    fn new(runtime_handle: runtime::Handle) -> Self {
-        LocalExecutor { runtime_handle }
-    }
-}
-
-impl<F> hyper::rt::Executor<F> for LocalExecutor
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send,
-{
-    fn execute(&self, fut: F) {
-        self.runtime_handle.spawn(fut);
-    }
-}
-
 #[allow(clippy::type_complexity)]
-impl hyper::service::Service<http::Request<Body>> for DoH {
+impl hyper::service::Service<http::Request<Incoming>> for DoH {
     type Error = http::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-    type Response = Response<Body>;
+    type Response = Response<Full<Bytes>>;
 
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
         let globals = &self.globals;
         let self_inner = self.clone();
         if req.uri().path() == globals.path {
@@ -141,7 +139,7 @@ impl hyper::service::Service<http::Request<Body>> for DoH {
 }
 
 impl DoH {
-    async fn serve_get(&self, req: Request<Body>) -> Result<Response<Body>, http::Error> {
+    async fn serve_get(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, http::Error> {
         match Self::parse_content_type(&req) {
             Ok(DoHType::Standard) => self.serve_doh_get(req).await,
             Ok(DoHType::Oblivious) => self.serve_odoh_get(req).await,
@@ -150,7 +148,7 @@ impl DoH {
         }
     }
 
-    async fn serve_post(&self, req: Request<Body>) -> Result<Response<Body>, http::Error> {
+    async fn serve_post(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, http::Error> {
         match Self::parse_content_type(&req) {
             Ok(DoHType::Standard) => self.serve_doh_post(req).await,
             Ok(DoHType::Oblivious) => self.serve_odoh_post(req).await,
@@ -163,7 +161,7 @@ impl DoH {
         &self,
         query: Vec<u8>,
         client_ip: Option<IpAddr>,
-    ) -> Result<Response<Body>, http::Error> {
+    ) -> Result<Response<Full<Bytes>>, http::Error> {
         let resp = match self.proxy(query, client_ip).await {
             Ok(resp) => {
                 self.build_response(resp.packet, resp.ttl, DoHType::Standard.as_str(), true)
@@ -176,7 +174,7 @@ impl DoH {
         }
     }
 
-    fn query_from_query_string(&self, req: Request<Body>) -> Option<Vec<u8>> {
+    fn query_from_query_string(&self, req: Request<Incoming>) -> Option<Vec<u8>> {
         let http_query = req.uri().query().unwrap_or("");
         let mut question_str = None;
         for parts in http_query.split('&') {
@@ -201,7 +199,10 @@ impl DoH {
         Some(query)
     }
 
-    async fn serve_doh_get(&self, req: Request<Body>) -> Result<Response<Body>, http::Error> {
+    async fn serve_doh_get(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, http::Error> {
         let client_ip = if self.globals.enable_ecs {
             edns_ecs::extract_client_ip(req.headers(), self.remote_addr)
         } else {
@@ -215,7 +216,10 @@ impl DoH {
         self.serve_doh_query(query, client_ip).await
     }
 
-    async fn serve_doh_post(&self, req: Request<Body>) -> Result<Response<Body>, http::Error> {
+    async fn serve_doh_post(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, http::Error> {
         if self.globals.disable_post {
             return http_error(StatusCode::METHOD_NOT_ALLOWED);
         }
@@ -233,7 +237,10 @@ impl DoH {
         self.serve_doh_query(query, client_ip).await
     }
 
-    async fn serve_odoh(&self, encrypted_query: Vec<u8>) -> Result<Response<Body>, http::Error> {
+    async fn serve_odoh(
+        &self,
+        encrypted_query: Vec<u8>,
+    ) -> Result<Response<Full<Bytes>>, http::Error> {
         let odoh_public_key = (*self.globals.odoh_rotator).clone().current_public_key();
         let (query, context) = match (*odoh_public_key).clone().decrypt_query(encrypted_query) {
             Ok((q, context)) => (q.to_vec(), context),
@@ -254,7 +261,10 @@ impl DoH {
         }
     }
 
-    async fn serve_odoh_get(&self, req: Request<Body>) -> Result<Response<Body>, http::Error> {
+    async fn serve_odoh_get(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, http::Error> {
         let encrypted_query = match self.query_from_query_string(req) {
             Some(encrypted_query) => encrypted_query,
             _ => return http_error_with_cache(StatusCode::BAD_REQUEST),
@@ -262,7 +272,10 @@ impl DoH {
         self.serve_odoh(encrypted_query).await
     }
 
-    async fn serve_odoh_post(&self, req: Request<Body>) -> Result<Response<Body>, http::Error> {
+    async fn serve_odoh_post(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, http::Error> {
         if self.globals.disable_post && !self.globals.allow_odoh_post {
             return http_error(StatusCode::METHOD_NOT_ALLOWED);
         }
@@ -273,7 +286,7 @@ impl DoH {
         self.serve_odoh(encrypted_query).await
     }
 
-    async fn serve_odoh_configs(&self) -> Result<Response<Body>, http::Error> {
+    async fn serve_odoh_configs(&self) -> Result<Response<Full<Bytes>>, http::Error> {
         let odoh_public_key = (*self.globals.odoh_rotator).clone().current_public_key();
         let configs = (*odoh_public_key).clone().into_config();
         match self.build_response(
@@ -287,7 +300,10 @@ impl DoH {
         }
     }
 
-    async fn serve_json_get(&self, req: Request<Body>) -> Result<Response<Body>, http::Error> {
+    async fn serve_json_get(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, http::Error> {
         use serde_json::json;
 
         // Parse query parameters
@@ -328,7 +344,7 @@ impl DoH {
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header(hyper::header::CONTENT_TYPE, "application/dns-json")
-                .body(Body::from(error_response.to_string()))
+                .body(Full::new(Bytes::from(error_response.to_string())))
                 .or_else(|_| http_error(StatusCode::INTERNAL_SERVER_ERROR));
         }
 
@@ -343,7 +359,7 @@ impl DoH {
                 return Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .header(hyper::header::CONTENT_TYPE, "application/dns-json")
-                    .body(Body::from(error_response.to_string()))
+                    .body(Full::new(Bytes::from(error_response.to_string())))
                     .or_else(|_| http_error(StatusCode::INTERNAL_SERVER_ERROR));
             }
         };
@@ -380,7 +396,7 @@ impl DoH {
                         ),
                     )
                     .header(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                    .body(Body::from(json_string))
+                    .body(Full::new(Bytes::from(json_string)))
                     .or_else(|_| http_error(StatusCode::INTERNAL_SERVER_ERROR))
             }
             Err(e) => {
@@ -391,7 +407,7 @@ impl DoH {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header(hyper::header::CONTENT_TYPE, "application/dns-json")
-                    .body(Body::from(error_response.to_string()))
+                    .body(Full::new(Bytes::from(error_response.to_string())))
                     .or_else(|_| http_error(StatusCode::INTERNAL_SERVER_ERROR))
             }
         }
@@ -420,7 +436,9 @@ impl DoH {
         None
     }
 
-    fn parse_content_type(req: &Request<Body>) -> Result<DoHType, Box<Response<Body>>> {
+    fn parse_content_type(
+        req: &Request<Incoming>,
+    ) -> Result<DoHType, Box<Response<Full<Bytes>>>> {
         const CT_DOH: &str = "application/dns-message";
         const CT_ODOH: &str = "application/oblivious-dns-message";
         const CT_JSON: &str = "application/dns-json";
@@ -436,7 +454,7 @@ impl DoH {
                         let response = Response::builder()
                             .status(StatusCode::NOT_ACCEPTABLE)
                             .header(hyper::header::CACHE_CONTROL, "max-age=31536000, immutable")
-                            .body(Body::empty())
+                            .body(Full::new(Bytes::new()))
                             .unwrap();
                         return Err(Box::new(response));
                     }
@@ -449,7 +467,7 @@ impl DoH {
                     let response = Response::builder()
                         .status(StatusCode::BAD_REQUEST)
                         .header(hyper::header::CACHE_CONTROL, "max-age=31536000, immutable")
-                        .body(Body::empty())
+                        .body(Full::new(Bytes::new()))
                         .unwrap();
                     return Err(Box::new(response));
                 }
@@ -466,25 +484,25 @@ impl DoH {
                 let response = Response::builder()
                     .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
                     .header(hyper::header::CACHE_CONTROL, "max-age=31536000, immutable")
-                    .body(Body::empty())
+                    .body(Full::new(Bytes::new()))
                     .unwrap();
                 Err(Box::new(response))
             }
         }
     }
 
-    async fn read_body(&self, mut body: Body) -> Result<Vec<u8>, DoHError> {
-        let mut sum_size = 0;
-        let mut query = vec![];
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|_| DoHError::TooLarge)?;
-            sum_size += chunk.len();
-            if sum_size >= MAX_DNS_QUESTION_LEN {
+    async fn read_body(&self, body: Incoming) -> Result<Vec<u8>, DoHError> {
+        if let Some(upper) = body.size_hint().upper() {
+            if upper >= MAX_DNS_QUESTION_LEN as u64 {
                 return Err(DoHError::TooLarge);
             }
-            query.extend(chunk);
         }
-        Ok(query)
+        let collected = body.collect().await.map_err(|_| DoHError::TooLarge)?;
+        let bytes = collected.to_bytes();
+        if bytes.len() >= MAX_DNS_QUESTION_LEN {
+            return Err(DoHError::TooLarge);
+        }
+        Ok(bytes.to_vec())
     }
 
     async fn proxy(
@@ -532,10 +550,12 @@ impl DoH {
             let expected_server_address = globals.server_address;
             socket
                 .send_to(&query, &globals.server_address)
-                .map_err(DoHError::Io)
-                .await?;
-            let (len, response_server_address) =
-                socket.recv_from(&mut packet).map_err(DoHError::Io).await?;
+                .await
+                .map_err(DoHError::Io)?;
+            let (len, response_server_address) = socket
+                .recv_from(&mut packet)
+                .await
+                .map_err(DoHError::Io)?;
             if len < MIN_DNS_PACKET_LEN || expected_server_address != response_server_address {
                 return Err(DoHError::UpstreamIssue);
             }
@@ -600,7 +620,7 @@ impl DoH {
         ttl: u32,
         content_type: String,
         cors: bool,
-    ) -> Result<Response<Body>, DoHError> {
+    ) -> Result<Response<Full<Bytes>>, DoHError> {
         let packet_len = packet.len();
         let mut response_builder = Response::builder()
             .header(hyper::header::CONTENT_LENGTH, packet_len)
@@ -618,12 +638,12 @@ impl DoH {
                 response_builder.header(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
         }
         let response = response_builder
-            .body(Body::from(packet))
+            .body(Full::new(Bytes::from(packet)))
             .map_err(|_| DoHError::InvalidData)?;
         Ok(response)
     }
 
-    async fn client_serve<I>(self, stream: I, server: Http<LocalExecutor>)
+    async fn client_serve<I>(self, stream: I, server_config: Arc<ServerConfig>)
     where
         I: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
@@ -632,39 +652,89 @@ impl DoH {
             clients_count.decrement();
             return;
         }
+        let timeout = self.globals.timeout + Duration::from_secs(1);
         self.globals.runtime_handle.clone().spawn(async move {
-            tokio::time::timeout(
-                self.globals.timeout + Duration::from_secs(1),
-                server.serve_connection(stream, self),
-            )
-            .await
-            .ok();
+            let server = server_config.build();
+            let io = TokioIo::new(stream);
+            let _ = tokio::time::timeout(timeout, server.serve_connection(io, self)).await;
             clients_count.decrement();
         });
     }
 
-    async fn start_without_tls(
+    async fn serve_listener_without_tls(
         self,
         listener: TcpListener,
-        server: Http<LocalExecutor>,
+        server_config: Arc<ServerConfig>,
+    ) {
+        while let Ok((stream, client_addr)) = listener.accept().await {
+            let mut doh = self.clone();
+            doh.remote_addr = Some(client_addr);
+            doh.client_serve(stream, Arc::clone(&server_config)).await;
+        }
+    }
+
+    async fn start_without_tls(
+        self,
+        listeners: Vec<TcpListener>,
+        server_config: Arc<ServerConfig>,
     ) -> Result<(), DoHError> {
-        let listener_service = async {
-            while let Ok((stream, client_addr)) = listener.accept().await {
-                let mut doh = self.clone();
-                doh.remote_addr = Some(client_addr);
-                doh.client_serve(stream, server.clone()).await;
-            }
-            Ok(()) as Result<(), DoHError>
-        };
-        listener_service.await?;
+        let mut handles = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let doh = self.clone();
+            let server_config = Arc::clone(&server_config);
+            handles.push(tokio::spawn(async move {
+                doh.serve_listener_without_tls(listener, server_config).await;
+            }));
+        }
+        let _ = join_all(handles).await;
         Ok(())
     }
 
+    async fn bind_listeners(&self) -> Result<Vec<(SocketAddr, TcpListener)>, DoHError> {
+        let mut listeners = Vec::new();
+        let mut last_error: Option<io::Error> = None;
+        let total = self.globals.listen_addresses.len();
+
+        if total == 0 {
+            return Err(DoHError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "No listen addresses configured",
+            )));
+        }
+
+        for address in &self.globals.listen_addresses {
+            match TcpListener::bind(address).await {
+                Ok(listener) => listeners.push((*address, listener)),
+                Err(err) => {
+                    eprintln!("Warning: Failed to bind {address}: {err}");
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        if listeners.is_empty() {
+            let err = last_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "No available listen addresses",
+                )
+            });
+            return Err(DoHError::Io(err));
+        }
+
+        if total > 1 && listeners.len() < total {
+            eprintln!(
+                "Warning: Bound {} of {} configured listen addresses.",
+                listeners.len(),
+                total
+            );
+        }
+
+        Ok(listeners)
+    }
+
     pub async fn entrypoint(self) -> Result<(), DoHError> {
-        let listen_address = self.globals.listen_address;
-        let listener = TcpListener::bind(&listen_address)
-            .await
-            .map_err(DoHError::Io)?;
+        let bound_listeners = self.bind_listeners().await?;
         let path = &self.globals.path;
 
         let tls_enabled: bool;
@@ -678,26 +748,34 @@ impl DoH {
                 self.globals.tls_cert_path.is_some() && self.globals.tls_cert_key_path.is_some();
         }
         if tls_enabled {
-            println!("Listening on https://{listen_address}{path}");
+            for (address, _) in &bound_listeners {
+                println!("Listening on https://{address}{path}");
+            }
         } else {
-            println!("Listening on http://{listen_address}{path}");
+            for (address, _) in &bound_listeners {
+                println!("Listening on http://{address}{path}");
+            }
         }
 
-        let mut server = Http::new();
-        server.http1_keep_alive(self.globals.keepalive);
-        server.http2_max_concurrent_streams(self.globals.max_concurrent_streams);
-        server.pipeline_flush(true);
-        let executor = LocalExecutor::new(self.globals.runtime_handle.clone());
-        let server = server.with_executor(executor);
+        let server_config = Arc::new(ServerConfig {
+            keepalive: self.globals.keepalive,
+            max_concurrent_streams: self.globals.max_concurrent_streams,
+        });
+
+        let listeners: Vec<TcpListener> = bound_listeners
+            .into_iter()
+            .map(|(_, listener)| listener)
+            .collect();
 
         #[cfg(feature = "tls")]
         {
             if tls_enabled {
-                self.start_with_tls(listener, server).await?;
+                self.start_with_tls(listeners, Arc::clone(&server_config))
+                    .await?;
                 return Ok(());
             }
         }
-        self.start_without_tls(listener, server).await?;
+        self.start_without_tls(listeners, server_config).await?;
         Ok(())
     }
 }
