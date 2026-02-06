@@ -111,12 +111,26 @@ impl DoH {
         server_config: Arc<HttpServerConfig>,
     ) -> Result<(), DoHError> {
         while let Ok((raw_stream, client_addr)) = listener.accept().await {
-            let current_acceptor = tls_acceptor_store.load();
-            if let Ok(stream) = current_acceptor.as_ref().as_ref().accept(raw_stream).await {
-                let mut doh = self.clone();
-                doh.remote_addr = Some(client_addr);
-                doh.client_serve(stream, Arc::clone(&server_config)).await
+            let clients_count = self.globals.clients_count.clone();
+            if clients_count.increment() >= self.globals.max_clients {
+                clients_count.decrement();
+                continue;
             }
+            let doh = self.clone();
+            let server_config = Arc::clone(&server_config);
+            let tls_acceptor_store = Arc::clone(&tls_acceptor_store);
+            let clients_count_task = clients_count.clone();
+            tokio::spawn(async move {
+                let current_acceptor = tls_acceptor_store.load();
+                if let Ok(stream) = current_acceptor.as_ref().as_ref().accept(raw_stream).await {
+                    let mut doh = doh;
+                    doh.remote_addr = Some(client_addr);
+                    doh.client_serve_reserved(stream, server_config, clients_count_task)
+                        .await;
+                } else {
+                    clients_count_task.decrement();
+                }
+            });
         }
         Ok(())
     }

@@ -1,13 +1,22 @@
 use std::net::SocketAddr;
 #[cfg(feature = "tls")]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use tokio::runtime;
+use url::Url;
 
 use crate::odoh::ODoHRotator;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client as HyperClient;
+
+pub type DohH2Client = HyperClient<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 #[derive(Debug)]
 pub struct Globals {
@@ -19,7 +28,8 @@ pub struct Globals {
 
     pub listen_addresses: Vec<SocketAddr>,
     pub local_bind_address: SocketAddr,
-    pub server_address: SocketAddr,
+    pub bootstrap_dns: Vec<SocketAddr>,
+    pub upstream: Upstream,
     pub path: String,
     pub max_clients: usize,
     pub timeout: Duration,
@@ -38,6 +48,37 @@ pub struct Globals {
     pub odoh_rotator: Arc<ODoHRotator>,
 
     pub runtime_handle: runtime::Handle,
+}
+
+#[derive(Clone, Debug)]
+pub enum Upstream {
+    Dns(SocketAddr),
+    Doh(DohUpstream),
+    Dot(DotUpstream),
+}
+
+#[derive(Clone, Debug)]
+pub struct DohUpstream {
+    pub url: Url,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+    pub authority: String,
+    pub h3_only: bool,
+    pub protocol_hint: Arc<AtomicU8>,
+    pub h3_failures: Arc<AtomicU32>,
+    pub h3_last_failure_ms: Arc<AtomicU64>,
+    pub h3_backoff_until_ms: Arc<AtomicU64>,
+    pub h2_last_rebuild_ms: Arc<AtomicU64>,
+    pub h3_last_rebuild_ms: Arc<AtomicU64>,
+    pub h2_client: Arc<ArcSwapOption<DohH2Client>>,
+    pub h2_target_addr: Arc<StdMutex<Option<SocketAddr>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DotUpstream {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Default)]

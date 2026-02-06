@@ -60,7 +60,7 @@ A fast and secure DoH (DNS-over-HTTPS) and ODoH (Oblivious DoH) server.
 - **Oblivious DoH (ODoH)** - Provides additional privacy by hiding client IP addresses
 - **EDNS Client Subnet** - Forward client IP information to upstream resolvers for geo-optimized responses
 - **High Performance** - Built with Rust and Tokio for excellent performance
-- **Flexible Deployment** - Can run standalone with built-in TLS or behind a reverse proxy
+- **Flexible Deployment** - Can run standalone with built-in TLS (HTTP/2 + HTTP/3) or behind a reverse proxy
 - **Production Ready** - Battle-tested in production environments since 2018
 - **Multiple IP Support** - Supports multiple external IP addresses for load balancing
 - **Automatic Certificate Reloading** - No downtime when updating TLS certificates
@@ -96,6 +96,13 @@ cargo install doh-proxy --no-default-features
 # Simple setup with a local DNS resolver
 doh-proxy -H 'doh.example.com' -u 127.0.0.1:53
 
+# Use a DoH upstream URL (HTTP/3 preferred, HTTP/2 fallback)
+doh-proxy -H 'doh.example.com' -u https://cloudflare-dns.com/dns-query
+# Use a DoH upstream URL (force HTTP/3)
+doh-proxy -H 'doh.example.com' -u h3://cloudflare-dns.com/dns-query
+# Use a DoT upstream URL (DNS-over-TLS)
+doh-proxy -H 'doh.example.com' -u tls://dns.adguard.com
+
 # With a specific public IP address
 doh-proxy -H 'doh.example.com' -u 127.0.0.1:53 -g 203.0.113.1
 
@@ -118,6 +125,7 @@ FLAGS:
 
 OPTIONS:
     -E, --err-ttl <err_ttl>                          TTL for errors, in seconds [default: 2]
+    -B, --bootstrap <ip:port>                        Bootstrap DNS for DoH and DoT, can be specified multiple times (default: use system-provided)
     -H, --hostname <hostname>                        Host name (not IP address) DoH clients will use to connect
     -l, --listen-address <listen_address>            Address to listen to (can be specified multiple times) [default: 127.0.0.1:3000]
     -b, --local-bind-address <local_bind_address>    Address to connect from
@@ -128,7 +136,7 @@ OPTIONS:
     -p, --path <path>                                URI path [default: /dns-query]
     -g, --public-address <public_address>            External IP address(es) DoH clients will connect to (can be specified multiple times)
     -j, --public-port <public_port>                  External port DoH clients will connect to, if not 443
-    -u, --server-address <server_address>            Address to connect to [default: 9.9.9.9:53]
+    -u, --upstream <upstream>                        Address or DoH/DoT URL to connect to [default: 9.9.9.9:53]
     -t, --timeout <timeout>                          Timeout, in seconds [default: 10]
     -I, --tls-cert-key-path <tls_cert_key_path>
             Path to the PEM-encoded secret keys (only required for built-in TLS)
@@ -221,6 +229,10 @@ doh-proxy -H 'doh.example.com' \
           -i /path/to/fullchain.pem \
           -I /path/to/privkey.pem
 ```
+
+With built-in TLS enabled, the server also starts an HTTP/3 listener on the
+same listen addresses (UDP). Make sure UDP is allowed on the chosen port if you
+want HTTP/3 clients to connect.
 
 **Certificate Requirements:**
 - Certificates and keys must be in PEM/PKCS#8 format

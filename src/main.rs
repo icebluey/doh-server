@@ -69,7 +69,8 @@ fn main() {
 
         listen_addresses: vec![default_listen_address],
         local_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        server_address,
+        bootstrap_dns: vec![],
+        upstream: Upstream::Dns(server_address),
         path: PATH.to_string(),
         max_clients: MAX_CLIENTS,
         timeout: Duration::from_secs(TIMEOUT_SEC),
