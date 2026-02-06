@@ -10,48 +10,47 @@ A fast and secure DoH (DNS-over-HTTPS) and ODoH (Oblivious DoH) server.
 
 ## Table of Contents
 
-- [](#)
-  - [Table of Contents](#table-of-contents)
-  - [Features](#features)
-  - [Installation](#installation)
-    - [Option 1: precompiled binaries for Linux](#option-1-precompiled-binaries-for-linux)
-    - [Option 2: from source code](#option-2-from-source-code)
-  - [Quick Start](#quick-start)
-    - [Basic Usage](#basic-usage)
-    - [Complete Usage Reference](#complete-usage-reference)
-    - [Example Configurations](#example-configurations)
-  - [Deployment Architectures](#deployment-architectures)
-    - [Behind a Reverse Proxy (Recommended)](#behind-a-reverse-proxy-recommended)
-    - [Standalone with Built-in TLS](#standalone-with-built-in-tls)
-  - [Integration Examples](#integration-examples)
-    - [With Encrypted DNS Server](#with-encrypted-dns-server)
-    - [With nginx](#with-nginx)
-    - [With HAProxy](#with-haproxy)
-  - [JSON API](#json-api)
-    - [Usage](#usage)
-    - [Supported Parameters](#supported-parameters)
-    - [Response Format](#response-format)
-  - [EDNS Client Subnet (ECS)](#edns-client-subnet-ecs)
-    - [Overview](#overview)
-    - [Configuration Options](#configuration-options)
-    - [How It Works](#how-it-works)
-    - [Examples](#examples)
-    - [Privacy Considerations](#privacy-considerations)
-  - [Oblivious DoH (ODoH)](#oblivious-doh-odoh)
-  - [Operational recommendations](#operational-recommendations)
-  - [DNS Stamps and Certificate Hashes](#dns-stamps-and-certificate-hashes)
-  - [Why Certificate Hashes in DoH Stamps Matter](#why-certificate-hashes-in-doh-stamps-matter)
-    - [Background](#background)
-    - [Why They’re Important](#why-theyre-important)
-    - [How Certificate Hashes Work in Stamps](#how-certificate-hashes-work-in-stamps)
-    - [Common certificate hashes](#common-certificate-hashes)
-  - [Troubleshooting](#troubleshooting)
-    - [Common Issues](#common-issues)
-    - [Performance Tuning](#performance-tuning)
-  - [Clients](#clients)
-  - [Public Deployments](#public-deployments)
-  - [Contributing](#contributing)
-  - [License](#license)
+- [Features](#features)
+- [Installation](#installation)
+  - [Option 1: precompiled binaries for Linux](#option-1-precompiled-binaries-for-linux)
+  - [Option 2: from source code](#option-2-from-source-code)
+- [Quick Start](#quick-start)
+  - [Basic Usage](#basic-usage)
+  - [Complete Usage Reference](#complete-usage-reference)
+  - [Upstream Behavior](#upstream-behavior)
+  - [Example Configurations](#example-configurations)
+- [Deployment Architectures](#deployment-architectures)
+  - [Behind a Reverse Proxy (Recommended)](#behind-a-reverse-proxy-recommended)
+  - [Standalone with Built-in TLS](#standalone-with-built-in-tls)
+- [Integration Examples](#integration-examples)
+  - [With Encrypted DNS Server](#with-encrypted-dns-server)
+  - [With nginx](#with-nginx)
+  - [With HAProxy](#with-haproxy)
+- [JSON API](#json-api)
+  - [Usage](#usage)
+  - [Supported Parameters](#supported-parameters)
+  - [Response Format](#response-format)
+- [EDNS Client Subnet (ECS)](#edns-client-subnet-ecs)
+  - [Overview](#overview)
+  - [Configuration Options](#configuration-options)
+  - [How It Works](#how-it-works)
+  - [Examples](#examples)
+  - [Privacy Considerations](#privacy-considerations)
+- [Oblivious DoH (ODoH)](#oblivious-doh-odoh)
+- [Operational recommendations](#operational-recommendations)
+- [DNS Stamps and Certificate Hashes](#dns-stamps-and-certificate-hashes)
+- [Why Certificate Hashes in DoH Stamps Matter](#why-certificate-hashes-in-doh-stamps-matter)
+  - [Background](#background)
+  - [Why They’re Important](#why-theyre-important)
+  - [How Certificate Hashes Work in Stamps](#how-certificate-hashes-work-in-stamps)
+  - [Common certificate hashes](#common-certificate-hashes)
+- [Troubleshooting](#troubleshooting)
+  - [Common Issues](#common-issues)
+  - [Performance Tuning](#performance-tuning)
+- [Clients](#clients)
+- [Public Deployments](#public-deployments)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
@@ -61,6 +60,7 @@ A fast and secure DoH (DNS-over-HTTPS) and ODoH (Oblivious DoH) server.
 - **EDNS Client Subnet** - Forward client IP information to upstream resolvers for geo-optimized responses
 - **High Performance** - Built with Rust and Tokio for excellent performance
 - **Flexible Deployment** - Can run standalone with built-in TLS (HTTP/2 + HTTP/3) or behind a reverse proxy
+- **Multiple Upstream Modes** - `load_balance`, `parallel`, and `fastest_addr` strategies
 - **Production Ready** - Battle-tested in production environments since 2018
 - **Multiple IP Support** - Supports multiple external IP addresses for load balancing
 - **Automatic Certificate Reloading** - No downtime when updating TLS certificates
@@ -103,6 +103,15 @@ doh-proxy -H 'doh.example.com' -u h3://cloudflare-dns.com/dns-query
 # Use a DoT upstream URL (DNS-over-TLS)
 doh-proxy -H 'doh.example.com' -u tls://dns.adguard.com
 
+# Multiple upstreams (weighted load balance is the default mode)
+doh-proxy -H 'doh.example.com' -u 9.9.9.9:53 -u 1.1.1.1:53
+
+# Multiple upstreams (race upstreams and return first valid reply)
+doh-proxy -H 'doh.example.com' \
+          -u 9.9.9.9:53 \
+          -u https://cloudflare-dns.com/dns-query \
+          --upstream-mode parallel
+
 # With a specific public IP address
 doh-proxy -H 'doh.example.com' -u 127.0.0.1:53 -g 203.0.113.1
 
@@ -113,40 +122,62 @@ doh-proxy -H 'doh.example.com' -u 127.0.0.1:53 -i /path/to/cert.pem -I /path/to/
 ### Complete Usage Reference
 
 ```text
-USAGE:
-    doh-proxy [FLAGS] [OPTIONS]
+Usage: doh-proxy [OPTIONS]
 
-FLAGS:
-    -O, --allow-odoh-post      Allow POST queries over ODoH even if they have been disabed for DoH
-    -K, --disable-keepalive    Disable keepalive
-    -P, --disable-post         Disable POST queries
-    -h, --help                 Prints help information
-    -V, --version              Prints version information
-
-OPTIONS:
-    -E, --err-ttl <err_ttl>                          TTL for errors, in seconds [default: 2]
-    -B, --bootstrap <ip:port>                        Bootstrap DNS for DoH and DoT, can be specified multiple times (default: use system-provided)
-    -H, --hostname <hostname>                        Host name (not IP address) DoH clients will use to connect
-    -l, --listen-address <listen_address>            Address to listen to (can be specified multiple times) [default: 127.0.0.1:3000]
-    -b, --local-bind-address <local_bind_address>    Address to connect from
-    -c, --max-clients <max_clients>                  Maximum number of simultaneous clients [default: 512]
-    -C, --max-concurrent <max_concurrent>            Maximum number of concurrent requests per client [default: 16]
-    -X, --max-ttl <max_ttl>                          Maximum TTL, in seconds [default: 604800]
-    -T, --min-ttl <min_ttl>                          Minimum TTL, in seconds [default: 10]
-    -p, --path <path>                                URI path [default: /dns-query]
-    -g, --public-address <public_address>            External IP address(es) DoH clients will connect to (can be specified multiple times)
-    -j, --public-port <public_port>                  External port DoH clients will connect to, if not 443
-    -u, --upstream <upstream>                        Address or DoH/DoT URL to connect to [default: 9.9.9.9:53]
-    -t, --timeout <timeout>                          Timeout, in seconds [default: 10]
-    -I, --tls-cert-key-path <tls_cert_key_path>
-            Path to the PEM-encoded secret keys (only required for built-in TLS)
-
-    -i, --tls-cert-path <tls_cert_path>
-            Path to the PEM/PKCS#8-encoded certificates (only required for built-in TLS)
-
-    --enable-ecs                              Enable EDNS Client Subnet
-    --ecs-prefix-v4 <ecs_prefix_v4>         IPv4 prefix length for EDNS Client Subnet [default: 24]
-    --ecs-prefix-v6 <ecs_prefix_v6>         IPv6 prefix length for EDNS Client Subnet [default: 56]
+Options:
+  -H, --hostname <hostname>
+          Host name (not IP address) DoH clients will use to connect
+  -g, --public-address <public_address>...
+          External IP address(es) DoH clients will connect to (can be specified multiple times)
+  -j, --public-port <public_port>
+          External port DoH clients will connect to, if not 443
+  -l, --listen-address <listen_address>
+          Address to listen to
+  -u, --upstream <upstream>
+          Address or DoH/DoT URL to connect to (https://, h3://, tls://), can be specified multiple
+          times
+      --upstream-mode <upstream_mode>
+          Upstream selection mode [default: load_balance] [possible values: load_balance, parallel,
+          fastest_addr]
+  -b, --local-bind-address <local_bind_address>
+          Address to connect from
+  -B, --bootstrap <ip:port>
+          Bootstrap DNS for DoH and DoT, can be specified multiple times (default: use
+          system-provided)
+  -p, --path <path>
+          URI path [default: /dns-query]
+  -c, --max-clients <max_clients>
+          Maximum number of simultaneous clients [default: 512]
+  -C, --max-concurrent <max_concurrent>
+          Maximum number of concurrent requests per client [default: 16]
+  -t, --timeout <timeout>
+          Timeout, in seconds [default: 10]
+  -T, --min-ttl <min_ttl>
+          Minimum TTL, in seconds [default: 10]
+  -X, --max-ttl <max_ttl>
+          Maximum TTL, in seconds [default: 604800]
+  -E, --err-ttl <err_ttl>
+          TTL for errors, in seconds [default: 2]
+  -K, --disable-keepalive
+          Disable keepalive
+  -P, --disable-post
+          Disable POST queries
+  -O, --allow-odoh-post
+          Allow POST queries over ODoH even if they have been disabed for DoH
+      --enable-ecs
+          Enable EDNS Client Subnet (forward client IP to upstream DNS)
+      --ecs-prefix-v4 <ecs_prefix_v4>
+          EDNS Client Subnet prefix length for IPv4 addresses [default: 24]
+      --ecs-prefix-v6 <ecs_prefix_v6>
+          EDNS Client Subnet prefix length for IPv6 addresses [default: 56]
+  -i, --tls-cert-path <tls_cert_path>
+          Path to the PEM/PKCS#8-encoded certificates (only required for built-in TLS)
+  -I, --tls-cert-key-path <tls_cert_key_path>
+          Path to the PEM-encoded secret keys (only required for built-in TLS)
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 **Listening behavior:**
@@ -154,6 +185,14 @@ OPTIONS:
 - The server attempts to bind all configured addresses.
 - If at least one bind succeeds, the server starts and logs failures for the rest.
 - If all binds fail, the server exits with an error.
+
+### Upstream Behavior
+
+- Pass multiple `-u/--upstream` values to configure fallback/racing behavior across resolvers.
+- `--upstream-mode load_balance` (default): picks one upstream using RTT-weighted selection and falls back to others on failure.
+- `--upstream-mode parallel`: sends the same query to all upstreams concurrently and returns the first valid response.
+- `--upstream-mode fastest_addr`: for `A`/`AAAA` replies, gathers candidates from all successful upstreams, probes returned IPs, and returns a response pinned to the fastest address.
+- `fastest_addr` falls back to `load_balance` behavior for non-`A`/`AAAA` query types.
 
 ### Example Configurations
 
@@ -549,11 +588,12 @@ doh-proxy -l 127.0.0.1:3001 ...
 
 For high-traffic deployments:
 ```sh
+# Increase client and per-client concurrency limits, and allow longer upstream timeouts
 doh-proxy -H 'doh.example.com' \
           -u 127.0.0.1:53 \
-          -c 10000 \     # Max clients
-          -C 100 \       # Max concurrent streams per client
-          -t 30          # Timeout in seconds
+          -c 10000 \
+          -C 100 \
+          -t 30
 ```
 
 ## Clients
