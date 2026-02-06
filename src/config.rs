@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
-use std::sync::Arc;
 #[cfg(feature = "tls")]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Arg, ArgAction::Append, ArgAction::SetTrue};
@@ -14,6 +14,130 @@ use crate::constants::*;
 fn exit_with_error(msg: &str) -> ! {
     eprintln!("Error: {}", msg);
     std::process::exit(1);
+}
+
+fn parse_upstream_arg(server_address_str: &str) -> Upstream {
+    if server_address_str.starts_with("http://")
+        || server_address_str.starts_with("https://")
+        || server_address_str.starts_with("h3://")
+        || server_address_str.starts_with("tls://")
+    {
+        let url = Url::parse(server_address_str).unwrap_or_else(|e| {
+            exit_with_error(&format!("Invalid URL '{}': {}", server_address_str, e))
+        });
+        match url.scheme() {
+            "https" | "h3" => {
+                let host = url
+                    .host_str()
+                    .unwrap_or_else(|| {
+                        exit_with_error(&format!(
+                            "DoH URL '{}' must include a host",
+                            server_address_str
+                        ))
+                    })
+                    .to_string();
+                let host_header = match url.host() {
+                    Some(Host::Ipv6(ip)) => format!("[{}]", ip),
+                    Some(Host::Ipv4(ip)) => ip.to_string(),
+                    Some(Host::Domain(domain)) => domain.to_string(),
+                    None => exit_with_error(&format!(
+                        "DoH URL '{}' must include a host",
+                        server_address_str
+                    )),
+                };
+                let port = if url.scheme() == "https" {
+                    url.port_or_known_default().unwrap_or(443)
+                } else {
+                    url.port().unwrap_or(443)
+                };
+                let mut path = url.path().to_string();
+                if path.is_empty() || path == "/" {
+                    path = PATH.to_string();
+                }
+                if let Some(query) = url.query() {
+                    path = format!("{path}?{query}");
+                }
+                let authority = if url.port().is_some() {
+                    format!("{host_header}:{port}")
+                } else {
+                    host_header
+                };
+                let h3_only = url.scheme() == "h3";
+                Upstream::Doh(DohUpstream {
+                    url,
+                    host,
+                    port,
+                    path,
+                    authority,
+                    h3_only,
+                    protocol_hint: Arc::new(AtomicU8::new(0)),
+                    h3_failures: Arc::new(AtomicU32::new(0)),
+                    h3_last_failure_ms: Arc::new(AtomicU64::new(0)),
+                    h3_backoff_until_ms: Arc::new(AtomicU64::new(0)),
+                    h2_last_rebuild_ms: Arc::new(AtomicU64::new(0)),
+                    h3_last_rebuild_ms: Arc::new(AtomicU64::new(0)),
+                    h2_client: Arc::new(Default::default()),
+                    h2_target_addr: Arc::new(Default::default()),
+                })
+            }
+            "tls" => {
+                let host = url
+                    .host_str()
+                    .unwrap_or_else(|| {
+                        exit_with_error(&format!(
+                            "DoT URL '{}' must include a host",
+                            server_address_str
+                        ))
+                    })
+                    .to_string();
+                let port = url.port().unwrap_or(853);
+                Upstream::Dot(DotUpstream { host, port })
+            }
+            "http" => {
+                exit_with_error("Only https://, h3://, or tls:// URLs are supported for upstreams");
+            }
+            _ => {
+                exit_with_error(&format!(
+                    "Unsupported URL scheme '{}' for upstream",
+                    url.scheme()
+                ));
+            }
+        }
+    } else {
+        let server_address = server_address_str
+            .to_socket_addrs()
+            .unwrap_or_else(|e| {
+                exit_with_error(&format!(
+                    "Invalid server address '{}': {}",
+                    server_address_str, e
+                ))
+            })
+            .next()
+            .unwrap_or_else(|| {
+                exit_with_error(&format!(
+                    "Cannot resolve server address '{}'",
+                    server_address_str
+                ))
+            });
+        Upstream::Dns(server_address)
+    }
+}
+
+fn default_local_bind_addr(upstream: &Upstream) -> SocketAddr {
+    match upstream {
+        Upstream::Dns(SocketAddr::V4(_)) => {
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        }
+        Upstream::Dns(SocketAddr::V6(s)) => SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::UNSPECIFIED,
+            0,
+            s.flowinfo(),
+            s.scope_id(),
+        )),
+        Upstream::Doh(_) | Upstream::Dot(_) => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        }
+    }
 }
 
 pub fn parse_opts(globals: &mut Globals) {
@@ -64,9 +188,17 @@ pub fn parse_opts(globals: &mut Globals) {
                 .short('u')
                 .long("upstream")
                 .num_args(1)
-                .default_value(SERVER_ADDRESS)
+                .action(Append)
                 .value_parser(verify_upstream)
-                .help("Address or DoH/DoT URL to connect to (https://, h3://, tls://)"),
+                .help("Address or DoH/DoT URL to connect to (https://, h3://, tls://), can be specified multiple times"),
+        )
+        .arg(
+            Arg::new("upstream_mode")
+                .long("upstream-mode")
+                .num_args(1)
+                .default_value("load_balance")
+                .value_parser(["load_balance", "parallel", "fastest_addr"])
+                .help("Upstream selection mode"),
         )
         .arg(
             Arg::new("local_bind_address")
@@ -224,130 +356,36 @@ pub fn parse_opts(globals: &mut Globals) {
         })],
     };
 
-    // Parse upstream
-    let server_address_str = matches
-        .get_one::<String>("upstream")
-        .expect("upstream has a default value");
-    globals.upstream = if server_address_str.starts_with("http://")
-        || server_address_str.starts_with("https://")
-        || server_address_str.starts_with("h3://")
-        || server_address_str.starts_with("tls://")
-    {
-        let url = Url::parse(server_address_str).unwrap_or_else(|e| {
-            exit_with_error(&format!("Invalid URL '{}': {}", server_address_str, e))
-        });
-        match url.scheme() {
-            "https" | "h3" => {
-                let host = url.host_str().unwrap_or_else(|| {
-                    exit_with_error(&format!(
-                        "DoH URL '{}' must include a host",
-                        server_address_str
-                    ))
-                }).to_string();
-                let host_header = match url.host() {
-                    Some(Host::Ipv6(ip)) => format!("[{}]", ip),
-                    Some(Host::Ipv4(ip)) => ip.to_string(),
-                    Some(Host::Domain(domain)) => domain.to_string(),
-                    None => {
-                        exit_with_error(&format!(
-                            "DoH URL '{}' must include a host",
-                            server_address_str
-                        ))
-                    }
-                };
-                let port = if url.scheme() == "https" {
-                    url.port_or_known_default().unwrap_or(443)
-                } else {
-                    url.port().unwrap_or(443)
-                };
-                let mut path = url.path().to_string();
-                if path.is_empty() || path == "/" {
-                    path = PATH.to_string();
-                }
-                if let Some(query) = url.query() {
-                    path = format!("{path}?{query}");
-                }
-                let authority = if url.port().is_some() {
-                    format!("{host_header}:{port}")
-                } else {
-                    host_header
-                };
-                let h3_only = url.scheme() == "h3";
-                Upstream::Doh(DohUpstream {
-                    url,
-                    host,
-                    port,
-                    path,
-                    authority,
-                    h3_only,
-                    protocol_hint: Arc::new(AtomicU8::new(0)),
-                    h3_failures: Arc::new(AtomicU32::new(0)),
-                    h3_last_failure_ms: Arc::new(AtomicU64::new(0)),
-                    h3_backoff_until_ms: Arc::new(AtomicU64::new(0)),
-                    h2_last_rebuild_ms: Arc::new(AtomicU64::new(0)),
-                    h3_last_rebuild_ms: Arc::new(AtomicU64::new(0)),
-                    h2_client: Arc::new(Default::default()),
-                    h2_target_addr: Arc::new(Default::default()),
-                })
-            }
-            "tls" => {
-                let host = url.host_str().unwrap_or_else(|| {
-                    exit_with_error(&format!(
-                        "DoT URL '{}' must include a host",
-                        server_address_str
-                    ))
-                }).to_string();
-                let port = url.port().unwrap_or(853);
-                Upstream::Dot(DotUpstream { host, port })
-            }
-            "http" => {
-                exit_with_error("Only https://, h3://, or tls:// URLs are supported for upstreams");
-            }
-            _ => {
-                exit_with_error(&format!(
-                    "Unsupported URL scheme '{}' for upstream",
-                    url.scheme()
-                ));
-            }
-        }
-    } else {
-        let server_address = server_address_str
-            .to_socket_addrs()
-            .unwrap_or_else(|e| {
-                exit_with_error(&format!(
-                    "Invalid server address '{}': {}",
-                    server_address_str, e
-                ))
-            })
-            .next()
-            .unwrap_or_else(|| {
-                exit_with_error(&format!(
-                    "Cannot resolve server address '{}'",
-                    server_address_str
-                ))
-            });
-        Upstream::Dns(server_address)
-    };
+    // Parse upstream mode
+    let upstream_mode = matches
+        .get_one::<String>("upstream_mode")
+        .expect("upstream_mode has a default value");
+    globals.upstream_mode =
+        UpstreamMode::from_str(upstream_mode).unwrap_or(UpstreamMode::LoadBalance);
+
+    // Parse upstreams
+    let upstream_values: Vec<String> = matches
+        .get_many::<String>("upstream")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_else(|| vec![SERVER_ADDRESS.to_string()]);
+    globals.upstreams = upstream_values
+        .iter()
+        .map(|value| parse_upstream_arg(value))
+        .collect();
+    if globals.upstreams.is_empty() {
+        globals.upstreams = vec![parse_upstream_arg(SERVER_ADDRESS)];
+    }
 
     // Parse local bind address
     globals.local_bind_address = match matches.get_one::<String>("local_bind_address") {
         Some(address) => address.parse().unwrap_or_else(|e| {
             exit_with_error(&format!("Invalid local bind address '{}': {}", address, e))
         }),
-        None => match globals.upstream {
-            Upstream::Dns(SocketAddr::V4(_)) => {
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-            }
-            Upstream::Dns(SocketAddr::V6(s)) => SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::UNSPECIFIED,
-                0,
-                s.flowinfo(),
-                s.scope_id(),
-            )),
-            Upstream::Doh(_) | Upstream::Dot(_) => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-            }
-        },
+        None => globals
+            .upstreams
+            .first()
+            .map(default_local_bind_addr)
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
     };
 
     // Parse bootstrap DNS addresses

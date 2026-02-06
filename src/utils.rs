@@ -41,12 +41,7 @@ pub(crate) fn verify_upstream(arg_val: &str) -> Result<String, String> {
                     "Only https://, h3://, or tls:// URLs are supported for upstreams".to_string(),
                 )
             }
-            _ => {
-                return Err(format!(
-                    "Unsupported URL scheme '{}'",
-                    url.scheme()
-                ))
-            }
+            _ => return Err(format!("Unsupported URL scheme '{}'", url.scheme())),
         }
         if url.host_str().is_none() {
             return Err("URL must include a host".to_string());

@@ -9,7 +9,7 @@ mod constants;
 mod utils;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use libdoh::odoh::ODoHRotator;
@@ -70,7 +70,10 @@ fn main() {
         listen_addresses: vec![default_listen_address],
         local_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         bootstrap_dns: vec![],
-        upstream: Upstream::Dns(server_address),
+        upstreams: vec![Upstream::Dns(server_address)],
+        upstream_mode: UpstreamMode::LoadBalance,
+        upstream_rtt_stats: Arc::new(StdMutex::new(Default::default())),
+        fastest_ip_cache: Arc::new(StdMutex::new(FastestIpCache::default())),
         path: PATH.to_string(),
         max_clients: MAX_CLIENTS,
         timeout: Duration::from_secs(TIMEOUT_SEC),

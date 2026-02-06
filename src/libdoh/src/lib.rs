@@ -5,6 +5,7 @@ mod edns_ecs;
 mod errors;
 mod globals;
 pub mod odoh;
+mod upstream;
 #[cfg(feature = "tls")]
 mod tls;
 
@@ -66,6 +67,7 @@ use rustls_platform_verifier::BuilderVerifierExt;
 use crate::constants::*;
 pub use crate::errors::*;
 pub use crate::globals::*;
+use crate::upstream::stats::QueryStatistics;
 
 pub mod reexports {
     pub use tokio;
@@ -570,6 +572,7 @@ impl DohH3Pool {
 struct DnsResponse {
     packet: Vec<u8>,
     ttl: u32,
+    query_stats: QueryStatistics,
 }
 
 #[derive(Clone, Debug)]
@@ -729,6 +732,7 @@ impl DoH {
     ) -> Result<Response<Full<Bytes>>, http::Error> {
         let resp = match self.proxy(query, client_ip).await {
             Ok(resp) => {
+                let _ = resp.query_stats.main();
                 self.build_response(resp.packet, resp.ttl, DoHType::Standard.as_str(), true)
             }
             Err(e) => return http_error(StatusCode::from(e)),
@@ -815,6 +819,7 @@ impl DoH {
             Ok(resp) => resp,
             Err(e) => return http_error(StatusCode::from(e)),
         };
+        let _ = resp.query_stats.main();
         let encrypted_resp = match context.encrypt_response(resp.packet) {
             Ok(resp) => self.build_response(resp, 0u32, DoHType::Oblivious.as_str(), false),
             Err(e) => return http_error(StatusCode::from(e)),
@@ -960,6 +965,7 @@ impl DoH {
         };
 
         let dns_response = self.proxy(query_packet, client_ip).await?;
+        let _ = dns_response.query_stats.main();
 
         // Parse DNS response to JSON
         match dns_json::parse_dns_to_json(&dns_response.packet) {
@@ -1185,14 +1191,9 @@ impl DoH {
             }
         }
         let globals = &self.globals;
-        let mut packet = match &globals.upstream {
-            Upstream::Dns(server_address) => {
-                self.run_with_timeout(self.proxy_dns_udp_tcp(query, *server_address))
-                    .await?
-            }
-            Upstream::Doh(doh) => self.proxy_doh(query, doh).await?,
-            Upstream::Dot(dot) => self.run_with_timeout(self.proxy_dot(query, dot)).await?,
-        };
+        let outcome = upstream::exchange(self, query).await;
+        let mut packet = outcome.packet?;
+        let query_stats = outcome.query_stats;
         let (min_ttl, max_ttl, err_ttl) = (globals.min_ttl, globals.max_ttl, globals.err_ttl);
 
         let ttl = if dns::is_recoverable_error(&packet) {
@@ -1206,7 +1207,11 @@ impl DoH {
         dns::add_edns_padding(&mut packet)
             .map_err(|_| DoHError::TooLarge)
             .ok();
-        Ok(DnsResponse { packet, ttl })
+        Ok(DnsResponse {
+            packet,
+            ttl,
+            query_stats,
+        })
     }
 
     async fn run_with_timeout<T>(
@@ -1802,6 +1807,7 @@ impl DoH {
         }
         let https = https_builder.enable_http1().enable_http2().wrap_connector(http);
         let mut builder = HyperClient::builder(TokioExecutor::new());
+        builder.timer(TokioTimer::new());
         builder.pool_timer(TokioTimer::new());
         builder.pool_idle_timeout(Duration::from_secs(DOH_H2_IDLE_CONN_TIMEOUT_SECS));
         builder.pool_max_idle_per_host(DOH_H2_MAX_IDLE_CONNS_PER_HOST);
@@ -2519,6 +2525,7 @@ impl DoH {
         match doh_type {
             DoHType::Standard => {
                 let resp = self.proxy(payload, client_ip).await?;
+                let _ = resp.query_stats.main();
                 let cache_control = format!(
                     "max-age={}, stale-if-error={}, stale-while-revalidate={}",
                     resp.ttl, STALE_IF_ERROR_SECS, STALE_WHILE_REVALIDATE_SECS
@@ -2537,6 +2544,7 @@ impl DoH {
                 let odoh_public_key = (*self.globals.odoh_rotator).clone().current_public_key();
                 let (query, context) = (*odoh_public_key).clone().decrypt_query(payload)?;
                 let resp = self.proxy(query, None).await?;
+                let _ = resp.query_stats.main();
                 let encrypted_resp = context.encrypt_response(resp.packet)?;
                 self.send_h3_response(
                     send,
