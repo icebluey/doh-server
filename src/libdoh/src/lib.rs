@@ -98,6 +98,7 @@ const DOH_H2_IDLE_CONN_TIMEOUT_SECS: u64 = 300;
 const DOH_H2_READ_IDLE_TIMEOUT_SECS: u64 = 30;
 const DOH_H2_MAX_IDLE_CONNS_PER_HOST: usize = 2;
 const H3_SUPERVISOR_RESTART_DELAY_MS: u64 = 500;
+const H3_SUPERVISOR_RESTART_DELAY_MAX_MS: u64 = 30_000;
 const H3_FAILURE_THRESHOLD: u32 = 3;
 const H3_FAILURE_WINDOW_SECS: u64 = 60;
 const H3_BACKOFF_SECS: u64 = 30;
@@ -2053,6 +2054,7 @@ impl DoH {
             None => return Err(DoHError::InvalidData),
         };
 
+        let mut had_successful_bind = false;
         loop {
             if let Err(err) = Self::validate_tls_files(&certs_path, &certs_keys_path) {
                 eprintln!("TLS certificates error: {err}");
@@ -2080,8 +2082,19 @@ impl DoH {
                         "No available HTTP/3 listen addresses",
                     )
                 });
+                if had_successful_bind && err.kind() == io::ErrorKind::AddrInUse {
+                    eprintln!(
+                        "Warning: HTTP/3 rebind conflict detected after a live listener existed; waiting for next certificate update"
+                    );
+                    if reload_rx.recv().await.is_none() {
+                        return Err(DoHError::Io(err));
+                    }
+                    while reload_rx.try_recv().is_ok() {}
+                    continue;
+                }
                 return Err(DoHError::Io(err));
             }
+            had_successful_bind = true;
 
             let certs_path_str = certs_path.to_string_lossy().to_string();
             let certs_keys_path_str = certs_keys_path.to_string_lossy().to_string();
@@ -2200,6 +2213,8 @@ impl DoH {
                     }
                 }
 
+                let mut last_cert_state = Self::tls_file_state(&certs_path);
+                let mut last_key_state = Self::tls_file_state(&certs_keys_path);
                 let handler = move |result: DebounceEventResult| {
                     match result {
                         Ok(events) => {
@@ -2213,7 +2228,13 @@ impl DoH {
                                 }
                             }
                             if changed {
-                                let _ = reload_tx.send(());
+                                let cert_state = Self::tls_file_state(&certs_path);
+                                let key_state = Self::tls_file_state(&certs_keys_path);
+                                if cert_state != last_cert_state || key_state != last_key_state {
+                                    last_cert_state = cert_state;
+                                    last_key_state = key_state;
+                                    let _ = reload_tx.send(());
+                                }
                             }
                         }
                         Err(errors) => {
@@ -2254,6 +2275,18 @@ impl DoH {
     }
 
     #[cfg(feature = "tls")]
+    fn tls_file_state(path: &Path) -> Option<(u64, u64)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata.modified().ok()?;
+        let modified_ms = modified
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        Some((modified_ms, metadata.len()))
+    }
+
+    #[cfg(feature = "tls")]
     async fn run_http3_supervisor(
         self,
         listen_addresses: Vec<SocketAddr>,
@@ -2274,6 +2307,7 @@ impl DoH {
             }
         };
 
+        let mut restart_delay_ms = H3_SUPERVISOR_RESTART_DELAY_MS;
         loop {
             match stop_rx.has_changed() {
                 Ok(true) | Err(_) => break,
@@ -2306,9 +2340,15 @@ impl DoH {
                 res = &mut h3_runner => {
                     let _ = watcher_shutdown.send(());
                     match res {
-                        Ok(()) => false,
+                        Ok(()) => {
+                            restart_delay_ms = H3_SUPERVISOR_RESTART_DELAY_MS;
+                            false
+                        }
                         Err(err) => {
-                            eprintln!("Warning: HTTP/3 listener exited, restarting: {err}");
+                            eprintln!(
+                                "Warning: HTTP/3 listener exited, restarting in {} ms: {err}",
+                                restart_delay_ms
+                            );
                             true
                         }
                     }
@@ -2321,8 +2361,10 @@ impl DoH {
 
             tokio::select! {
                 _ = stop_rx.changed() => break,
-                _ = tokio::time::sleep(Duration::from_millis(H3_SUPERVISOR_RESTART_DELAY_MS)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(restart_delay_ms)) => {}
             }
+            restart_delay_ms =
+                (restart_delay_ms.saturating_mul(2)).min(H3_SUPERVISOR_RESTART_DELAY_MAX_MS);
         }
     }
 
